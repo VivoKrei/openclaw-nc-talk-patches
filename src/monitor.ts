@@ -77,7 +77,7 @@ function resolveRichMessageText(
   parameters: Record<string, NextcloudTalkRichObjectParameter> | undefined,
 ): string {
   if (!parameters) return message;
-  return message.replace(/\{(\w+)\}/g, (match, key: string) => {
+  return message.replace(/\{([\w-]+)\}/g, (match, key: string) => {
     const param = parameters[key];
     return param?.name ?? match;
   });

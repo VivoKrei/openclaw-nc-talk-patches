@@ -208,6 +208,7 @@ describe("payloadToInboundMessage — rich content", () => {
       }),
     });
     const msg = payloadToInboundMessage(payload);
+    // {mention-user1} contains a hyphen, resolved via [\w-]+ regex
     expect(msg.text).toBe("Hello Radek");
     // Non-file parameter types should not appear in fileParameters
     expect(msg.fileParameters).toBeUndefined();
