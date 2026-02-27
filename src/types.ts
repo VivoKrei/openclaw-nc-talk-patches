@@ -109,10 +109,28 @@ export type NextcloudTalkObject = {
   id: string;
   /** Message text (same as content for text/plain). */
   name: string;
-  /** Message content. */
+  /** Message content (JSON-encoded rich content string). */
   content: string;
   /** Media type of the content. */
   mediaType: string;
+};
+
+/** A single rich object parameter (file, mention, etc.) from parsed content JSON. */
+export type NextcloudTalkRichObjectParameter = {
+  type: string;
+  id: string;
+  name: string;
+  size?: number;
+  path?: string;
+  link?: string;
+  mimetype?: string;
+  "preview-available"?: string;
+};
+
+/** Parsed structure of NextcloudTalkObject.content when it contains rich content. */
+export type NextcloudTalkRichContent = {
+  message: string;
+  parameters?: Record<string, NextcloudTalkRichObjectParameter>;
 };
 
 /** Target conversation/room. */
@@ -150,6 +168,10 @@ export type NextcloudTalkInboundMessage = {
   mediaType: string;
   timestamp: number;
   isGroupChat: boolean;
+  /** Media/file URLs extracted from rich object parameters. */
+  mediaUrls?: string[];
+  /** Raw file parameters from rich content, used to construct download URLs. */
+  fileParameters?: NextcloudTalkRichObjectParameter[];
 };
 
 /** Headers sent by Nextcloud Talk webhook. */
