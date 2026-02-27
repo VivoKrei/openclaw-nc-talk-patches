@@ -140,6 +140,34 @@ describe("processContent (simulates payloadToInboundMessage)", () => {
   });
 });
 
+describe("real-world NC Talk payloads", () => {
+  it("handles actual file+mention message from our NC Talk (msg 5862)", () => {
+    // Real payload captured from vivokrei-ubuntu NC Talk API
+    const r = processContent(JSON.stringify({
+      message: "{mention-user1} this is what I bought in that Polish store.",
+      parameters: {
+        actor: { type: "user", id: "rados", name: "Radek", "mention-id": "rados" },
+        file: { type: "file", id: "122459", name: "IMG_1772227153579.jpg", size: "2204779", path: "Talk/IMG_1772227153579.jpg", link: "https://vivokrei-ubuntu.tailfc1e89.ts.net/index.php/f/122459", mimetype: "image/jpeg", "preview-available": "yes", width: "3024", height: "4032" },
+        "mention-user1": { type: "user", id: "Vault", name: "Volt", "mention-id": "Vault" }
+      }
+    }), "");
+    expect(r.text).toBe("Volt this is what I bought in that Polish store.");
+    expect(r.fileParameters).toHaveLength(1);
+    expect(r.fileParameters![0].name).toBe("IMG_1772227153579.jpg");
+    expect(r.fileParameters![0].mimetype).toBe("image/jpeg");
+    expect(r.fileParameters![0].path).toBe("Talk/IMG_1772227153579.jpg");
+  });
+
+  it("constructs correct WebDAV URL for real file", () => {
+    const url = buildFileDownloadUrl(
+      { type: "file", id: "122459", name: "IMG_1772227153579.jpg", path: "Talk/IMG_1772227153579.jpg", link: "https://vivokrei-ubuntu.tailfc1e89.ts.net/index.php/f/122459", mimetype: "image/jpeg" },
+      "https://vivokrei-ubuntu.tailfc1e89.ts.net",
+      "Vault"
+    );
+    expect(url).toBe("https://vivokrei-ubuntu.tailfc1e89.ts.net/remote.php/dav/files/Vault/Talk/IMG_1772227153579.jpg");
+  });
+});
+
 describe("buildFileDownloadUrl", () => {
   it("constructs WebDAV URL when baseUrl + apiUser + path available", () => {
     const url = buildFileDownloadUrl({ type: "file", id: "1", name: "test.jpg", path: "Talk/test.jpg" }, "https://cloud.example.com", "Vault");
