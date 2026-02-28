@@ -196,7 +196,7 @@ export function createNextcloudTalkWebhookServer(opts: NextcloudTalkWebhookServe
         return;
       }
 
-      if (payload.type !== "Create") {
+      if (payload.type !== "Create" && payload.type !== "Activity") {
         res.writeHead(200);
         res.end();
         return;

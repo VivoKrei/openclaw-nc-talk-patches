@@ -8,7 +8,7 @@ function makePayload(
 ): NextcloudTalkWebhookPayload {
   return {
     type: "Create",
-    actor: { type: "Person", id: "users/rados", name: "Radek" },
+    actor: { type: "Person", id: "users/alice", name: "Alice" },
     object: {
       type: "Note",
       id: "100",
@@ -201,15 +201,15 @@ describe("payloadToInboundMessage — rich content", () => {
         parameters: {
           "mention-user1": {
             type: "user",
-            id: "rados",
-            name: "Radek",
+            id: "alice",
+            name: "Alice",
           },
         },
       }),
     });
     const msg = payloadToInboundMessage(payload);
     // {mention-user1} contains a hyphen, resolved via [\w-]+ regex
-    expect(msg.text).toBe("Hello Radek");
+    expect(msg.text).toBe("Hello Alice");
     // Non-file parameter types should not appear in fileParameters
     expect(msg.fileParameters).toBeUndefined();
   });
@@ -222,8 +222,8 @@ describe("payloadToInboundMessage — rich content", () => {
     expect(msg.messageId).toBe("100");
     expect(msg.roomToken).toBe("room123");
     expect(msg.roomName).toBe("TestRoom");
-    expect(msg.senderId).toBe("users/rados");
-    expect(msg.senderName).toBe("Radek");
+    expect(msg.senderId).toBe("users/alice");
+    expect(msg.senderName).toBe("Alice");
     expect(msg.mediaType).toBe("text/markdown");
     expect(msg.isGroupChat).toBe(true);
   });

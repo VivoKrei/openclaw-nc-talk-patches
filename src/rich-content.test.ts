@@ -133,45 +133,45 @@ describe("processContent (simulates payloadToInboundMessage)", () => {
   it("non-file parameter types (mentions) — no fileParameters", () => {
     const r = processContent(JSON.stringify({
       message: "Hello {mention-user1}",
-      parameters: { "mention-user1": { type: "user", id: "rados", name: "Radek" } }
+      parameters: { "mention-user1": { type: "user", id: "alice", name: "Alice" } }
     }), "");
-    expect(r.text).toBe("Hello Radek");
+    expect(r.text).toBe("Hello Alice");
     expect(r.fileParameters).toBeUndefined();
   });
 });
 
 describe("real-world NC Talk payloads", () => {
   it("handles actual file+mention message from our NC Talk (msg 5862)", () => {
-    // Real payload captured from vivokrei-ubuntu NC Talk API
+    // Real-world style payload with file + mention parameters
     const r = processContent(JSON.stringify({
-      message: "{mention-user1} this is what I bought in that Polish store.",
+      message: "{mention-user1} check out this shared file.",
       parameters: {
-        actor: { type: "user", id: "rados", name: "Radek", "mention-id": "rados" },
-        file: { type: "file", id: "122459", name: "IMG_1772227153579.jpg", size: "2204779", path: "Talk/IMG_1772227153579.jpg", link: "https://vivokrei-ubuntu.tailfc1e89.ts.net/index.php/f/122459", mimetype: "image/jpeg", "preview-available": "yes", width: "3024", height: "4032" },
-        "mention-user1": { type: "user", id: "Vault", name: "Volt", "mention-id": "Vault" }
+        actor: { type: "user", id: "alice", name: "Alice", "mention-id": "alice" },
+        file: { type: "file", id: "12345", name: "shared-photo.jpg", size: "2000000", path: "Talk/shared-photo.jpg", link: "https://cloud.example.com/index.php/f/122459", mimetype: "image/jpeg", "preview-available": "yes", width: "3024", height: "4032" },
+        "mention-user1": { type: "user", id: "bot-user", name: "Bot", "mention-id": "bot-user" }
       }
     }), "");
-    expect(r.text).toBe("Volt this is what I bought in that Polish store.");
+    expect(r.text).toBe("Bot check out this shared file.");
     expect(r.fileParameters).toHaveLength(1);
-    expect(r.fileParameters![0].name).toBe("IMG_1772227153579.jpg");
+    expect(r.fileParameters![0].name).toBe("shared-photo.jpg");
     expect(r.fileParameters![0].mimetype).toBe("image/jpeg");
-    expect(r.fileParameters![0].path).toBe("Talk/IMG_1772227153579.jpg");
+    expect(r.fileParameters![0].path).toBe("Talk/shared-photo.jpg");
   });
 
   it("constructs correct WebDAV URL for real file", () => {
     const url = buildFileDownloadUrl(
-      { type: "file", id: "122459", name: "IMG_1772227153579.jpg", path: "Talk/IMG_1772227153579.jpg", link: "https://vivokrei-ubuntu.tailfc1e89.ts.net/index.php/f/122459", mimetype: "image/jpeg" },
-      "https://vivokrei-ubuntu.tailfc1e89.ts.net",
-      "Vault"
+      { type: "file", id: "12345", name: "shared-photo.jpg", path: "Talk/shared-photo.jpg", link: "https://cloud.example.com/index.php/f/122459", mimetype: "image/jpeg" },
+      "https://cloud.example.com",
+      "bot-user"
     );
-    expect(url).toBe("https://vivokrei-ubuntu.tailfc1e89.ts.net/remote.php/dav/files/Vault/Talk/IMG_1772227153579.jpg");
+    expect(url).toBe("https://cloud.example.com/remote.php/dav/files/bot-user/Talk/shared-photo.jpg");
   });
 });
 
 describe("buildFileDownloadUrl", () => {
   it("constructs WebDAV URL when baseUrl + apiUser + path available", () => {
-    const url = buildFileDownloadUrl({ type: "file", id: "1", name: "test.jpg", path: "Talk/test.jpg" }, "https://cloud.example.com", "Vault");
-    expect(url).toBe("https://cloud.example.com/remote.php/dav/files/Vault/Talk/test.jpg");
+    const url = buildFileDownloadUrl({ type: "file", id: "1", name: "test.jpg", path: "Talk/test.jpg" }, "https://cloud.example.com", "bot-user");
+    expect(url).toBe("https://cloud.example.com/remote.php/dav/files/bot-user/Talk/test.jpg");
   });
 
   it("falls back to link when apiUser missing", () => {

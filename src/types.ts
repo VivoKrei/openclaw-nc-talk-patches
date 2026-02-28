@@ -144,7 +144,7 @@ export type NextcloudTalkTarget = {
 
 /** Incoming webhook payload from Nextcloud Talk. */
 export type NextcloudTalkWebhookPayload = {
-  type: "Create" | "Update" | "Delete";
+  type: "Create" | "Update" | "Delete" | "Activity";
   actor: NextcloudTalkActor;
   object: NextcloudTalkObject;
   target: NextcloudTalkTarget;
