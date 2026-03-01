@@ -109,28 +109,12 @@ export type NextcloudTalkObject = {
   id: string;
   /** Message text (same as content for text/plain). */
   name: string;
-  /** Message content (JSON-encoded rich content string). */
+  /** Message content. */
   content: string;
   /** Media type of the content. */
   mediaType: string;
-};
-
-/** A single rich object parameter (file, mention, etc.) from parsed content JSON. */
-export type NextcloudTalkRichObjectParameter = {
-  type: string;
-  id: string;
-  name: string;
-  size?: number;
-  path?: string;
-  link?: string;
-  mimetype?: string;
-  "preview-available"?: string;
-};
-
-/** Parsed structure of NextcloudTalkObject.content when it contains rich content. */
-export type NextcloudTalkRichContent = {
-  message: string;
-  parameters?: Record<string, NextcloudTalkRichObjectParameter>;
+  /** Thread ID — present when message is part of an NC Talk thread (NC Talk 20+). */
+  threadId?: string;
 };
 
 /** Target conversation/room. */
@@ -144,7 +128,7 @@ export type NextcloudTalkTarget = {
 
 /** Incoming webhook payload from Nextcloud Talk. */
 export type NextcloudTalkWebhookPayload = {
-  type: "Create" | "Update" | "Delete" | "Activity";
+  type: "Create" | "Update" | "Delete";
   actor: NextcloudTalkActor;
   object: NextcloudTalkObject;
   target: NextcloudTalkTarget;
@@ -168,10 +152,8 @@ export type NextcloudTalkInboundMessage = {
   mediaType: string;
   timestamp: number;
   isGroupChat: boolean;
-  /** Media/file URLs extracted from rich object parameters. */
-  mediaUrls?: string[];
-  /** Raw file parameters from rich content, used to construct download URLs. */
-  fileParameters?: NextcloudTalkRichObjectParameter[];
+  /** Thread ID — present when message is part of an NC Talk thread (NC Talk 20+). */
+  threadId?: string;
 };
 
 /** Headers sent by Nextcloud Talk webhook. */
@@ -191,6 +173,9 @@ export type NextcloudTalkWebhookServerOptions = {
   path: string;
   secret: string;
   maxBodyBytes?: number;
+  readBody?: (req: import("node:http").IncomingMessage, maxBodyBytes: number) => Promise<string>;
+  isBackendAllowed?: (backend: string) => boolean;
+  shouldProcessMessage?: (message: NextcloudTalkInboundMessage) => boolean | Promise<boolean>;
   onMessage: (message: NextcloudTalkInboundMessage) => void | Promise<void>;
   onError?: (error: Error) => void;
   abortSignal?: AbortSignal;

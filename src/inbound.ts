@@ -1,18 +1,20 @@
-import { readFileSync } from "node:fs";
 import {
   GROUP_POLICY_BLOCKED_LABEL,
+  createScopedPairingAccess,
+  createNormalizedOutboundDeliverer,
   createReplyPrefixOptions,
-  createTypingCallbacks,
+  formatTextWithAttachmentLinks,
   logInboundDrop,
-  logTypingFailure,
-  resolveControlCommandGate,
+  readStoreAllowFromForDmPolicy,
+  resolveDmGroupAccessWithCommandGate,
+  resolveOutboundMediaUrls,
   resolveAllowlistProviderRuntimeGroupPolicy,
   resolveDefaultGroupPolicy,
   warnMissingProviderGroupPolicyFallbackOnce,
+  type OutboundReplyPayload,
   type OpenClawConfig,
   type RuntimeEnv,
 } from "openclaw/plugin-sdk";
-import { createNcTalkTypingManager } from "./signaling-typing.js";
 import type { ResolvedNextcloudTalkAccount } from "./accounts.js";
 import {
   normalizeNextcloudTalkAllowlist,
@@ -25,92 +27,21 @@ import {
 import { resolveNextcloudTalkRoomKind } from "./room-info.js";
 import { getNextcloudTalkRuntime } from "./runtime.js";
 import { sendMessageNextcloudTalk } from "./send.js";
-import type {
-  CoreConfig,
-  GroupPolicy,
-  NextcloudTalkInboundMessage,
-  NextcloudTalkRichObjectParameter,
-} from "./types.js";
+import type { CoreConfig, GroupPolicy, NextcloudTalkInboundMessage } from "./types.js";
 
 const CHANNEL_ID = "nextcloud-talk" as const;
 
-/**
- * Build a WebDAV download URL for a file parameter.
- * Prefers constructing from known baseUrl/apiUser for security;
- * falls back to the `link` field from the parameter.
- */
-function buildFileDownloadUrl(
-  file: NextcloudTalkRichObjectParameter,
-  baseUrl: string,
-  apiUser: string | undefined,
-): string | undefined {
-  if (baseUrl && apiUser && file.path) {
-    const encodedPath = file.path.split("/").map(encodeURIComponent).join("/");
-    return `${baseUrl}/remote.php/dav/files/${encodeURIComponent(apiUser)}/${encodedPath}`;
-  }
-  return file.link || undefined;
-}
-
-/**
- * Build attachment annotation lines for the agent body.
- */
-function buildAttachmentBlock(
-  fileParams: NextcloudTalkRichObjectParameter[],
-  baseUrl: string,
-  apiUser: string | undefined,
-): string {
-  const lines: string[] = [];
-  for (const file of fileParams) {
-    const isImage = file.mimetype?.startsWith("image/") ?? false;
-    const typeLabel = isImage ? "an image" : "a file";
-    lines.push(`[User shared ${typeLabel}: ${file.name}]`);
-    const url = buildFileDownloadUrl(file, baseUrl, apiUser);
-    if (url) {
-      lines.push(`Attachment: ${url}`);
-    }
-  }
-  return lines.join("\n");
-}
-
-function resolveNcApiPassword(cfg: {
-  apiPassword?: string;
-  apiPasswordFile?: string;
-}): string | undefined {
-  if (cfg.apiPassword?.trim()) return cfg.apiPassword.trim();
-  if (!cfg.apiPasswordFile) return undefined;
-  try {
-    return readFileSync(cfg.apiPasswordFile, "utf-8").trim() || undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 async function deliverNextcloudTalkReply(params: {
-  payload: { text?: string; mediaUrls?: string[]; mediaUrl?: string; replyToId?: string };
+  payload: OutboundReplyPayload;
   roomToken: string;
   accountId: string;
   statusSink?: (patch: { lastOutboundAt?: number }) => void;
 }): Promise<void> {
   const { payload, roomToken, accountId, statusSink } = params;
-  const text = payload.text ?? "";
-  const mediaList = payload.mediaUrls?.length
-    ? payload.mediaUrls
-    : payload.mediaUrl
-      ? [payload.mediaUrl]
-      : [];
-
-  if (!text.trim() && mediaList.length === 0) {
+  const combined = formatTextWithAttachmentLinks(payload.text, resolveOutboundMediaUrls(payload));
+  if (!combined) {
     return;
   }
-
-  const mediaBlock = mediaList.length
-    ? mediaList.map((url) => `Attachment: ${url}`).join("\n")
-    : "";
-  const combined = text.trim()
-    ? mediaBlock
-      ? `${text.trim()}\n\n${mediaBlock}`
-      : text.trim()
-    : mediaBlock;
 
   await sendMessageNextcloudTalk(roomToken, combined, {
     accountId,
@@ -128,10 +59,16 @@ export async function handleNextcloudTalkInbound(params: {
 }): Promise<void> {
   const { message, account, config, runtime, statusSink } = params;
   const core = getNextcloudTalkRuntime();
+  const pairing = createScopedPairingAccess({
+    core,
+    channel: CHANNEL_ID,
+    accountId: account.accountId,
+  });
 
   const rawBody = message.text?.trim() ?? "";
-  const hasFileAttachments = (message.fileParameters?.length ?? 0) > 0;
-  if (!rawBody && !hasFileAttachments) {
+  // Thread context annotation (prepended to body if in a thread)
+  const threadAnnotation = message.threadId ? `[Thread ID: ${message.threadId}]\n` : "";
+  if (!rawBody) {
     return;
   }
 
@@ -145,6 +82,7 @@ export async function handleNextcloudTalkInbound(params: {
   const senderName = message.senderName;
   const roomToken = message.roomToken;
   const roomName = message.roomName;
+  const threadId = message.threadId;
 
   statusSink?.({ lastInboundAt: message.timestamp });
 
@@ -168,10 +106,12 @@ export async function handleNextcloudTalkInbound(params: {
 
   const configAllowFrom = normalizeNextcloudTalkAllowlist(account.config.allowFrom);
   const configGroupAllowFrom = normalizeNextcloudTalkAllowlist(account.config.groupAllowFrom);
-  const storeAllowFrom =
-    dmPolicy === "allowlist"
-      ? []
-      : await core.channel.pairing.readAllowFromStore({ channel: CHANNEL_ID, accountId: account.accountId }).catch(() => []);
+  const storeAllowFrom = await readStoreAllowFromForDmPolicy({
+    provider: CHANNEL_ID,
+    accountId: account.accountId,
+    dmPolicy,
+    readStore: pairing.readStoreForDmPolicy,
+  });
   const storeAllowList = normalizeNextcloudTalkAllowlist(storeAllowFrom);
 
   const roomMatch = resolveNextcloudTalkRoomMatch({
@@ -190,11 +130,6 @@ export async function handleNextcloudTalkInbound(params: {
   }
 
   const roomAllowFrom = normalizeNextcloudTalkAllowlist(roomConfig?.allowFrom);
-  const baseGroupAllowFrom =
-    configGroupAllowFrom.length > 0 ? configGroupAllowFrom : configAllowFrom;
-
-  const effectiveAllowFrom = [...configAllowFrom, ...storeAllowList].filter(Boolean);
-  const effectiveGroupAllowFrom = [...baseGroupAllowFrom, ...storeAllowList].filter(Boolean);
 
   const allowTextCommands = core.channel.commands.shouldHandleTextCommands({
     cfg: config as OpenClawConfig,
@@ -202,25 +137,33 @@ export async function handleNextcloudTalkInbound(params: {
   });
   const useAccessGroups =
     (config.commands as Record<string, unknown> | undefined)?.useAccessGroups !== false;
-  const senderAllowedForCommands = resolveNextcloudTalkAllowlistMatch({
-    allowFrom: isGroup ? effectiveGroupAllowFrom : effectiveAllowFrom,
-    senderId,
-  }).allowed;
   const hasControlCommand = core.channel.text.hasControlCommand(rawBody, config as OpenClawConfig);
-  const commandGate = resolveControlCommandGate({
-    useAccessGroups,
-    authorizers: [
-      {
-        configured: (isGroup ? effectiveGroupAllowFrom : effectiveAllowFrom).length > 0,
-        allowed: senderAllowedForCommands,
-      },
-    ],
-    allowTextCommands,
-    hasControlCommand,
+  const access = resolveDmGroupAccessWithCommandGate({
+    isGroup,
+    dmPolicy,
+    groupPolicy,
+    allowFrom: configAllowFrom,
+    groupAllowFrom: configGroupAllowFrom,
+    storeAllowFrom: storeAllowList,
+    isSenderAllowed: (allowFrom) =>
+      resolveNextcloudTalkAllowlistMatch({
+        allowFrom,
+        senderId,
+      }).allowed,
+    command: {
+      useAccessGroups,
+      allowTextCommands,
+      hasControlCommand,
+    },
   });
-  const commandAuthorized = commandGate.commandAuthorized;
+  const commandAuthorized = access.commandAuthorized;
+  const effectiveGroupAllowFrom = access.effectiveGroupAllowFrom;
 
   if (isGroup) {
+    if (access.decision !== "allow") {
+      runtime.log?.(`nextcloud-talk: drop group sender ${senderId} (reason=${access.reason})`);
+      return;
+    }
     const groupAllow = resolveNextcloudTalkGroupAllow({
       groupPolicy,
       outerAllowFrom: effectiveGroupAllowFrom,
@@ -232,48 +175,35 @@ export async function handleNextcloudTalkInbound(params: {
       return;
     }
   } else {
-    if (dmPolicy === "disabled") {
-      runtime.log?.(`nextcloud-talk: drop DM sender=${senderId} (dmPolicy=disabled)`);
-      return;
-    }
-    if (dmPolicy !== "open") {
-      const dmAllowed = resolveNextcloudTalkAllowlistMatch({
-        allowFrom: effectiveAllowFrom,
-        senderId,
-      }).allowed;
-      if (!dmAllowed) {
-        if (dmPolicy === "pairing") {
-          const { code, created } = await core.channel.pairing.upsertPairingRequest({
-            channel: CHANNEL_ID,
-            id: senderId,
-            meta: { name: senderName || undefined },
-          });
-          if (created) {
-            try {
-              await sendMessageNextcloudTalk(
-                roomToken,
-                core.channel.pairing.buildPairingReply({
-                  channel: CHANNEL_ID,
-                  idLine: `Your Nextcloud user id: ${senderId}`,
-                  code,
-                }),
-                { accountId: account.accountId },
-              );
-              statusSink?.({ lastOutboundAt: Date.now() });
-            } catch (err) {
-              runtime.error?.(
-                `nextcloud-talk: pairing reply failed for ${senderId}: ${String(err)}`,
-              );
-            }
+    if (access.decision !== "allow") {
+      if (access.decision === "pairing") {
+        const { code, created } = await pairing.upsertPairingRequest({
+          id: senderId,
+          meta: { name: senderName || undefined },
+        });
+        if (created) {
+          try {
+            await sendMessageNextcloudTalk(
+              roomToken,
+              core.channel.pairing.buildPairingReply({
+                channel: CHANNEL_ID,
+                idLine: `Your Nextcloud user id: ${senderId}`,
+                code,
+              }),
+              { accountId: account.accountId },
+            );
+            statusSink?.({ lastOutboundAt: Date.now() });
+          } catch (err) {
+            runtime.error?.(`nextcloud-talk: pairing reply failed for ${senderId}: ${String(err)}`);
           }
         }
-        runtime.log?.(`nextcloud-talk: drop DM sender ${senderId} (dmPolicy=${dmPolicy})`);
-        return;
       }
+      runtime.log?.(`nextcloud-talk: drop DM sender ${senderId} (reason=${access.reason})`);
+      return;
     }
   }
 
-  if (isGroup && commandGate.shouldBlock) {
+  if (access.shouldBlockControlCommand) {
     logInboundDrop({
       log: (message) => runtime.log?.(message),
       channel: CHANNEL_ID,
@@ -328,34 +258,20 @@ export async function handleNextcloudTalkInbound(params: {
     storePath,
     sessionKey: route.sessionKey,
   });
-  // Build attachment block from file parameters if present
-  const attachmentBlock = hasFileAttachments
-    ? buildAttachmentBlock(
-        message.fileParameters!,
-        account.baseUrl,
-        account.config.apiUser?.trim(),
-      )
-    : "";
-  const agentBody = attachmentBlock
-    ? rawBody
-      ? `${rawBody}\n\n${attachmentBlock}`
-      : attachmentBlock
-    : rawBody;
-
   const body = core.channel.reply.formatAgentEnvelope({
     channel: "Nextcloud Talk",
     from: fromLabel,
     timestamp: message.timestamp,
     previousTimestamp,
     envelope: envelopeOptions,
-    body: agentBody,
+    body: rawBody,
   });
 
   const groupSystemPrompt = roomConfig?.systemPrompt?.trim() || undefined;
 
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: body,
-    BodyForAgent: agentBody,
+    BodyForAgent: rawBody,
     RawBody: rawBody,
     CommandBody: rawBody,
     From: isGroup ? `nextcloud-talk:room:${roomToken}` : `nextcloud-talk:${senderId}`,
@@ -393,51 +309,21 @@ export async function handleNextcloudTalkInbound(params: {
     channel: CHANNEL_ID,
     accountId: account.accountId,
   });
-
-  // Typing indicators via HPB WebSocket signaling (optional — requires apiUser + apiPassword)
-  const apiUser = account.config.apiUser?.trim();
-  const apiPassword = resolveNcApiPassword(account.config);
-  const typingCallbacks = (() => {
-    if (!apiUser || !apiPassword) return undefined;
-    const mgr = createNcTalkTypingManager({
-      baseUrl: account.baseUrl,
-      apiUser,
-      apiPassword,
+  const deliverReply = createNormalizedOutboundDeliverer(async (payload) => {
+    await deliverNextcloudTalkReply({
+      payload: threadId ? { ...payload, replyToId: payload.replyToId ?? threadId } : payload,
       roomToken,
-      allowInsecureSsl: (account.config as Record<string, unknown>).allowInsecureSsl === true,
+      accountId: account.accountId,
+      statusSink,
     });
-    return createTypingCallbacks({
-      start: () => mgr.sendTyping(),
-      stop: () => mgr.stop(),
-      onStartError: (err) =>
-        logTypingFailure({
-          log: runtime.log ?? (() => undefined),
-          channel: CHANNEL_ID,
-          target: roomToken,
-          error: err,
-        }),
-    });
-  })();
+  });
 
   await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: ctxPayload,
     cfg: config as OpenClawConfig,
     dispatcherOptions: {
       ...prefixOptions,
-      typingCallbacks,
-      deliver: async (payload) => {
-        await deliverNextcloudTalkReply({
-          payload: payload as {
-            text?: string;
-            mediaUrls?: string[];
-            mediaUrl?: string;
-            replyToId?: string;
-          },
-          roomToken,
-          accountId: account.accountId,
-          statusSink,
-        });
-      },
+      deliver: deliverReply,
       onError: (err, info) => {
         runtime.error?.(`nextcloud-talk ${info.kind} reply failed: ${String(err)}`);
       },
