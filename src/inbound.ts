@@ -48,6 +48,151 @@ function resolveNcApiPassword(cfg: {
   }
 }
 
+/**
+ * Reply context enrichment — local patch (pending upstream PR)
+ *
+ * Fetches the current message (by its own ID) from the NC Talk chat API,
+ * reads the `parent` field that Talk includes when a message is a reply,
+ * and returns a formatted quote string for injection into agent context.
+ *
+ * Key design decisions (based on Opus code review):
+ *  - Fetches the INCOMING message itself (not threadId) to get the true parent,
+ *    since threadId is the thread root which may differ from the direct reply target.
+ *  - Validates messageId is numeric before constructing URL.
+ *  - Checks HTTP status and OCS meta before parsing.
+ *  - Strips HTML tags from parent message text.
+ *  - 2s timeout to minimize latency impact.
+ *  - Simple in-process LRU cache (max 50 entries) to avoid refetching.
+ *  - All errors swallowed — returns null, caller falls back to unmodified body.
+ */
+
+/** Strip HTML tags from a string (simple regex, sufficient for NC Talk messages). */
+function stripHtml(text: string): string {
+  return text.replace(/<[^>]*>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").trim();
+}
+
+/** Simple bounded Map-based cache for parent message lookups. */
+const _parentMsgCache = new Map<string, string | null>();
+const PARENT_CACHE_MAX = 50;
+
+function cacheGet(key: string): string | null | undefined {
+  return _parentMsgCache.get(key);
+}
+
+function cacheSet(key: string, value: string | null): void {
+  if (_parentMsgCache.size >= PARENT_CACHE_MAX) {
+    // Evict oldest entry
+    const firstKey = _parentMsgCache.keys().next().value;
+    if (firstKey !== undefined) _parentMsgCache.delete(firstKey);
+  }
+  _parentMsgCache.set(key, value);
+}
+
+type NcTalkParentMessage = {
+  id: number;
+  message: string;
+  actorDisplayName?: string;
+};
+
+type NcTalkMessageWithParent = {
+  id: number;
+  parent?: NcTalkParentMessage;
+};
+
+async function fetchReplyParentText(params: {
+  baseUrl: string;
+  apiUser: string;
+  apiPassword: string;
+  roomToken: string;
+  /** The ID of the incoming message (not threadId). */
+  messageId: string;
+  allowInsecureSsl?: boolean;
+}): Promise<string | null> {
+  const { baseUrl, apiUser, apiPassword, roomToken, messageId } = params;
+
+  // Validate numeric ID before constructing URL
+  const numericId = parseInt(messageId, 10);
+  if (!Number.isFinite(numericId) || numericId <= 0) return null;
+
+  const cacheKey = `${roomToken}:${messageId}`;
+  const cached = cacheGet(cacheKey);
+  if (cached !== undefined) return cached;
+
+  try {
+    // Fetch 1 message ending at messageId (lastKnownMessageId = messageId + 1)
+    const url = `${baseUrl}/ocs/v2.php/apps/spreed/api/v1/chat/${roomToken}?lookIntoFuture=0&limit=1&lastKnownMessageId=${numericId + 1}`;
+    const { request: httpsRequest } = await import("node:https");
+    const { request: httpRequest } = await import("node:http");
+    const auth = Buffer.from(`${apiUser}:${apiPassword}`).toString("base64");
+
+    const { statusCode, body: rawData } = await new Promise<{ statusCode: number; body: string }>(
+      (resolve, reject) => {
+        const req = (url.startsWith("https") ? httpsRequest : httpRequest)(
+          url,
+          {
+            method: "GET",
+            headers: {
+              "Authorization": `Basic ${auth}`,
+              "OCS-APIRequest": "true",
+              "Accept": "application/json",
+            },
+            rejectUnauthorized: params.allowInsecureSsl ? false : true,
+          },
+          (res) => {
+            const chunks: Buffer[] = [];
+            res.on("data", (chunk: Buffer) => chunks.push(chunk));
+            res.on("end", () =>
+              resolve({ statusCode: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf-8") }),
+            );
+          },
+        );
+        req.on("error", reject);
+        req.setTimeout(2000, () => {
+          req.destroy();
+          reject(new Error("timeout"));
+        });
+        req.end();
+      },
+    );
+
+    if (statusCode < 200 || statusCode >= 300) {
+      cacheSet(cacheKey, null);
+      return null;
+    }
+
+    const parsed = JSON.parse(rawData) as {
+      ocs?: {
+        meta?: { status?: string };
+        data?: NcTalkMessageWithParent[];
+      };
+    };
+
+    if (parsed?.ocs?.meta?.status !== "ok") {
+      cacheSet(cacheKey, null);
+      return null;
+    }
+
+    const messages = parsed?.ocs?.data ?? [];
+    const match = messages.find((m) => m.id === numericId);
+    const parent = match?.parent;
+
+    if (!parent) {
+      cacheSet(cacheKey, null);
+      return null;
+    }
+
+    const author = parent.actorDisplayName ?? "unknown";
+    const text = stripHtml(parent.message ?? "");
+    const result = `> **${author}:** ${text}`;
+    cacheSet(cacheKey, result);
+    return result;
+  } catch {
+    // Best-effort — don't let enrichment errors break message handling
+    cacheSet(cacheKey, null);
+    return null;
+  }
+}
+
 async function deliverNextcloudTalkReply(params: {
   payload: OutboundReplyPayload;
   roomToken: string;
@@ -98,6 +243,7 @@ export async function handleNextcloudTalkInbound(params: {
   const roomToken = message.roomToken;
   const roomName = message.roomName;
   const threadId = message.threadId;
+
 
   statusSink?.({ lastInboundAt: message.timestamp });
 
@@ -273,21 +419,43 @@ export async function handleNextcloudTalkInbound(params: {
     storePath,
     sessionKey: route.sessionKey,
   });
+
+  // Reply context enrichment: NC Talk bot webhooks don't include threadId/parent in the payload,
+  // so we always fetch the incoming message from the chat API to check for a `parent` field.
+  // Non-reply messages are cached as null after the first fetch (cheap on subsequent calls).
+  // Requires apiUser + apiPassword (same creds as typing indicators). Best-effort: never throws.
+  const replyApiUser = account.config.apiUser?.trim();
+  const replyApiPassword = resolveNcApiPassword(account.config);
+  let enrichedBody = rawBody;
+  if (replyApiUser && replyApiPassword) {
+    const parentQuote = await fetchReplyParentText({
+      baseUrl: account.baseUrl,
+      apiUser: replyApiUser,
+      apiPassword: replyApiPassword,
+      roomToken,
+      messageId: message.messageId,
+      allowInsecureSsl: account.config.allowInsecureSsl ?? false,
+    });
+    if (parentQuote) {
+      enrichedBody = `${parentQuote}\n\n${rawBody}`;
+    }
+  }
+
   const body = core.channel.reply.formatAgentEnvelope({
     channel: "Nextcloud Talk",
     from: fromLabel,
     timestamp: message.timestamp,
     previousTimestamp,
     envelope: envelopeOptions,
-    body: rawBody,
+    body: enrichedBody,
   });
 
   const groupSystemPrompt = roomConfig?.systemPrompt?.trim() || undefined;
 
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: body,
-    BodyForAgent: rawBody,
-    RawBody: rawBody,
+    BodyForAgent: enrichedBody,
+    RawBody: enrichedBody,
     CommandBody: rawBody,
     From: isGroup ? `nextcloud-talk:room:${roomToken}` : `nextcloud-talk:${senderId}`,
     To: `nextcloud-talk:${roomToken}`,
